@@ -39,14 +39,20 @@ import sys
 
 import iothub_client
 # pylint: disable=E0611
-from iothub_client import IoTHubModuleClient, IoTHubClientError, IoTHubTransportProvider
+from iothub_client import IoTHubClient, IoTHubModuleClient, IoTHubClientError, IoTHubTransportProvider
 from iothub_client import IoTHubMessage, IoTHubMessageDispositionResult, IoTHubError, DeviceMethodReturnValue
 
 from edge_st_sdk.edge_client import EdgeClient
 from edge_st_sdk.utils.edge_st_exceptions import WrongInstantiationException
 from edge_st_sdk.azure.azure_utils import ReceiveContext
+from enum import Enum
 
 # CLASSES
+
+class AzureEdgeProtocol(Enum):
+    HTTP = 0
+    AMQP = 1
+    MQTT = 2
 
 class AzureClient(EdgeClient):
     """Class responsible for handling an Azure Edge Module client used for MQTT/AMQP
@@ -56,38 +62,54 @@ class AzureClient(EdgeClient):
     """Timeout for messages"""
     _subscribe_callback = None
 
-    def __init__(self, module_name, protocol):
+    def __init__(self, module_name, connection_string=None, root_ca_cert=None, protocol=IoTHubTransportProvider.MQTT):
         self.module_name = module_name
         self.client_protocol = protocol
-        self.client = IoTHubModuleClient()
-        self._connected = False       
+        self.connection_string = connection_string
+        self.root_ca_cert = root_ca_cert
+        if self.connection_string is None:
+            self.client = IoTHubModuleClient()
+        else:
+            self.client = IoTHubClient(self.connection_string, self.client_protocol)
+        self._connected = False
 
     def get_name(self):
         return self.module_name
 
-    def connect(self):
-        # not really a "connect"
-        self.client.create_from_environment(self.client_protocol)
-         # set the time until a message times out
-        self.client.set_option("messageTimeout", self._TIMEOUT_s)        
+    def connect(self):        
+        if self.connection_string is None:
+            # not really a "connect"
+            self.client.create_from_environment(self.client_protocol)
+        else:
+            if len(self.root_ca_cert) > 0:
+                cert_data = ''
+                with open(self.root_ca_cert, 'rb') as cert_file:
+                    cert_data = cert_file.read()
+                try:
+                    self.client.set_option("TrustedCerts", cert_data)
+                except IoTHubClientError as iothub_client_error:
+                    return False
+        # set the time until a message times out
+        self.client.set_option("messageTimeout", self._TIMEOUT_s)
         self._connected = True
         return True
 
     def disconnect(self):
         # not supported
-        return
+        self._connected = False
 
-    def publish(self, outputQueueName, msg, send_confirmation_callback, send_context):
+    def publish(self, msg, send_confirmation_callback, topic=None, send_context=None):
         if self._connected:
             event = IoTHubMessage(bytearray(msg, 'utf8'))
-            self.client.send_event_async(
-            outputQueueName, event, send_confirmation_callback, send_context)
+            self.client.send_event_async(topic, event, send_confirmation_callback, send_context) \
+                if self.connection_string is None \
+                else self.client.send_event_async(event, send_confirmation_callback, send_context)
 
-    def subscribe(self, topic, callback, user_context):
+    def subscribe(self, callback, topic=None, user_context=None):
         if self._connected:
-            rcvContext = ReceiveContext(callback, user_context)
-            self.client.set_message_callback(topic, self._subscribe_callback, rcvContext)
-        return
+            self.client.set_message_callback(topic, self._subscribe_callback, ReceiveContext(callback, user_context)) \
+                if self.connection_string is None \
+                else self.client.set_message_callback(self._subscribe_callback, ReceiveContext(callback, 0))
 
     def unsubscribe(self, topic):
         # not supported
@@ -96,9 +118,8 @@ class AzureClient(EdgeClient):
 
     # Send Twin reported properties
     def update_shadow_state(self, payload, callback, context):
-        if self._connected:    
+        if self._connected:
             self.client.send_reported_state(payload, len(payload), callback, context)
-        return
 
     def get_shadow_state(self, callback, timeout_s):
         # not supported
@@ -110,17 +131,22 @@ class AzureClient(EdgeClient):
         return
 
     # Sets the callback when a module twin's desired properties are updated.
-    def set_module_twin_callback(self, twin_callback, user_context):
+    def set_twin_callback(self, twin_callback, user_context):
         if self._connected:
-            self.client.set_module_twin_callback(twin_callback, user_context)
+            self.client.set_module_twin_callback(twin_callback, user_context) \
+                if self.connection_string is None \
+                else self.client.set_device_twin_callback(twin_callback, user_context)
 
     # Register a callback for module method
-    def set_module_method_callback(self, method_callback, user_context):
-        if self._connected:        
-            self.client.set_module_method_callback(method_callback, user_context)
+    def set_method_callback(self, method_callback, user_context):
+        if self._connected:
+            self.client.set_module_method_callback(method_callback, user_context) \
+                if self.connection_string is None \
+                else self.client.set_device_method_callback(method_callback, user_context)
 
     def _subscribe_callback(self, message, context):
         callback = context._get_callback()
+        # print('\n_subscribe_calback')
         callback(message, context._get_context())
         return IoTHubMessageDispositionResult.ACCEPTED
 

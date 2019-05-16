@@ -294,8 +294,8 @@ def main(protocol):
         module_client.connect()
 
         # Setting subscriptions.
-        module_client.subscribe(BLE2_APPMOD_INPUT, receive_ble2_message_callback, module_client)
-        module_client.subscribe(BLE1_APPMOD_INPUT, receive_ble1_message_callback, module_client)        
+        module_client.subscribe(receive_ble2_message_callback, BLE2_APPMOD_INPUT, module_client)
+        module_client.subscribe(receive_ble1_message_callback, BLE1_APPMOD_INPUT, module_client)        
 
         # Edge Computing Initialized.
         print('\nEdge Computing Initialized.')
@@ -345,20 +345,3 @@ def main(protocol):
 
 if __name__ == '__main__':
     main(PROTOCOL)
-
-
-# for discovered in discovered_devices:
-#                     device_name = discovered.get_name()
-#                     print('%d) %s: [%s]' % (i, discovered.get_name(), discovered.get_tag()))
-#                     if discovered.get_tag() == IOT_DEVICE_1_MAC:
-#                         iot_device_1 = discovered
-#                         devices.append(iot_device_1)
-#                         print("IOT_DEVICE device 1 found!")
-#                     elif discovered.get_tag() == IOT_DEVICE_2_MAC:
-#                         iot_device_2 = discovered
-#                         devices.append(iot_device_2)
-#                         print("IOT_DEVICE device 2 found!")
-#                     if len(devices) == 2:
-#                         break
-#                     i += 1
-#                 break
