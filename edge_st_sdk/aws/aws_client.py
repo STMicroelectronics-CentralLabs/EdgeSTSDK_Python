@@ -36,12 +36,15 @@ AWS IoT cloud and performing edge operations through the Greengrass SDK.
 # IMPORT
 
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 from AWSIoTPythonSDK.MQTTLib import AWSIoTMQTTShadowClient
 
+from edge_st_sdk.utils.python_utils import lock
 from edge_st_sdk.edge_client import EdgeClient
+from edge_st_sdk.edge_client import EdgeClientStatus
 import edge_st_sdk.aws.aws_greengrass
-from edge_st_sdk.utils.edge_st_exceptions import WrongInstantiationException
+from edge_st_sdk.utils.edge_st_exceptions import EdgeSTInvalidOperationException
 
 
 # CLASSES
@@ -53,32 +56,55 @@ class AWSClient(EdgeClient):
     _TIMEOUT_s = 10
     """Timeout for discovering information."""
 
+    _NUMBER_OF_THREADS = 5
+    """Number of threads to be used to notify the listeners."""
+
     def __init__(self, client_name, device_certificate_path, \
         device_private_key_path, group_ca_path, core_info):
         """Constructor.
 
-        Args:
-            client_name (str): Name of the client, as it is on the cloud.
-            device_certificate_path (str): Relative path of the device's
-                certificate stored on the core device.
-            device_private_key_path (str): Relative path of the device's
-                private key stored on the core device.
-            group_ca_path (str): Relative path of the certification authority's
-                certificate stored on the core device.
-            core_info (list): Information related to the core of the group to
-                which the client belongs.
+        AWSClient has to be instantiated through a call to the
+        :meth:`edge_st_sdk.aws.aws_greengrass.AWSGreengrass.get_client` method.
 
-        Raises:
-            :exc:`edge_st_sdk.utils.edge_st_exceptions.WrongInstantiationException`
-                is raised if the discovery of the core has not been completed
-                yet, i.e. if the AWSClient has not been instantiated through a
-                call to the
-                :meth:`edge_st_sdk.aws.aws_greengrass.AWSGreengrass.get_client`
-                method.
+        :param client_name: Name of the client, as it is on the cloud.
+        :type client_name: str
+
+        :param device_certificate_path: Relative path of the device's
+            certificate stored on the core device.
+        :type device_certificate_path: str
+
+        :param device_private_key_path: Relative path of the device's private
+            key stored on the core device.
+        :type device_private_key_path: str
+
+        :param group_ca_path: Relative path of the certification authority's
+            certificate stored on the core device.
+        :type group_ca_path: str
+
+        :param core_info: Information related to the core of the group to which
+            the client belongs.
+        :type core_info: list
+
+        :raises EdgeSTInvalidOperationException: is raised if the discovery of
+            the core has not been completed yet, i.e. if the AWSClient has not
+            been instantiated through a call to the
+            :meth:`edge_st_sdk.aws.aws_greengrass.AWSGreengrass.get_client`
+            method.
         """
+        self._status = EdgeClientStatus.INIT
+        """Status."""
+
+        self._thread_pool = ThreadPoolExecutor(AWSClient._NUMBER_OF_THREADS)
+        """Pool of thread used to notify the listeners."""
+
+        self._listeners = []
+        """List of listeners to the feature changes.
+        It is a thread safe list, so a listener can subscribe itself through a
+        callback."""
+
         # Check the client is created with the right pattern (Builder).
         if not edge_st_sdk.aws.aws_greengrass.AWSGreengrass.discovery_completed():
-            raise WrongInstantiationException('Amazon AWS clients must be ' \
+            raise EdgeSTInvalidOperationException('Amazon AWS clients must be ' \
                 'obtained through a call to the \'get_client()\' method of an ' \
                 '\'AWSGreengrass\' object.')
 
@@ -103,64 +129,79 @@ class AWSClient(EdgeClient):
         self._shadow_handler = self._shadow_client.createShadowHandlerWithName(
             self._client_name, True)
 
+        # Updating client.
+        self._update_status(EdgeClientStatus.IDLE)
+
     def get_name(self):
         """Get the client name. 
 
-        Returns:
-            str: The client name, i.e. the name of the client.
+        :returns: The client name, i.e. the name of the client.
+        :rtype: str
         """
         return self._client_name
 
     def connect(self):
         """Connect to the core.
 
-        Returns:
-            bool: True if the connection was successful, False otherwise.
+        :returns: True if the connection was successful, False otherwise.
+        :rtype: bool
         """
-        # Iterate through the connection options for the core and use the first
-        # successful one.
-        for connectivity_info in self._core_info.connectivityInfoList:
-            self._current_host = connectivity_info.host
-            self._current_port = connectivity_info.port
-            # print("Trying to connect to core at %s:%d..." % \
-            #     (self._current_host, self._current_port))
-            self._shadow_client.configureEndpoint(
-                self._current_host,
-                self._current_port)
-            self._shadow_client.configureAutoReconnectBackoffTime(1, 32, 20)
-            self._shadow_client.configureConnectDisconnectTimeout(
-                self._TIMEOUT_s)
-            self._shadow_client.configureMQTTOperationTimeout(
-                self._TIMEOUT_s / 2.0)
-            try:
-                self._shadow_client.connect()
-                self._connected = True
-                break
-            except BaseException as e:
-                self._connected = False
+        # Updating client.
+        self._update_status(EdgeClientStatus.CONNECTING)
 
-        # if not self._connected:
-        #     print("Cannot connect to core %s. Exiting..." % \
-        #         (self._core_info.coreThingArn))
-        #     sys.exit(-2)
-        # else:
-        #     print("Shadow device %s successfully connected to core %s." % \
-        #         (self._client_name, self._core_info.coreThingArn))
+        # Connecting.
+        if not self._connected:
+            # Iterate through the connection options for the core and use the
+            # first successful one.
+            for connectivity_info in self._core_info.connectivityInfoList:
+                self._current_host = connectivity_info.host
+                self._current_port = connectivity_info.port
+                self._shadow_client.configureEndpoint(
+                    self._current_host,
+                    self._current_port)
+                self._shadow_client.configureAutoReconnectBackoffTime(1, 32, 20)
+                self._shadow_client.configureConnectDisconnectTimeout(
+                    self._TIMEOUT_s)
+                self._shadow_client.configureMQTTOperationTimeout(
+                    self._TIMEOUT_s / 2.0)
+                try:
+                    self._shadow_client.connect()
+                    self._connected = True
+                    break
+                except BaseException as e:
+                    self._connected = False
+        if self._connected:
+            self._update_status(EdgeClientStatus.CONNECTED)
+        else:
+            self._update_status(EdgeClientStatus.UNREACHABLE)
+
         return self._connected
 
     def disconnect(self):
         """Disconnect from the core."""
+        # Updating client.
+        self._update_status(EdgeClientStatus.DISCONNECTING)
+
+        # Disconnecting.
         if self._connected:
             self._shadow_client.disconnect()
+            self._connected = False
+
+        # Updating client.
+        self._update_status(EdgeClientStatus.DISCONNECTED)
 
     def publish(self, topic, payload, qos):
         """Publish a new message to the desired topic with the given quality of
         service.
 
-        Args:
-            topic (str): Topic name to publish to.
-            payload (str): Payload to publish (JSON formatted string).
-            qos (int): Quality of Service. Could be "0" or "1".
+        :param topic: Topic name to publish to.
+        :type topic: str
+
+        :param payload: Payload to publish (JSON formatted string).
+        :type payload: str
+
+        :param qos: Quality of Service. Could be "0" or "1".
+        :type qos: int
         """
         if self._connected:
             self._client.publish(topic, payload, qos)
@@ -169,11 +210,14 @@ class AWSClient(EdgeClient):
         """Subscribe to the desired topic with the given quality of service and
         register a callback to handle the published messages.
 
-        Args:
-            topic (str): Topic name to publish to.
-            qos (int): Quality of Service. Could be "0" or "1".
-            callback: Function to be called when a new message for the
-                subscribed topic comes in.
+        :param topic: Topic name to publish to.
+        :type topic: str
+
+        :param qos: Quality of Service. Could be "0" or "1".
+        :type qos: int
+
+        :param callback: Function to be called when a new message for the
+            subscribed topic comes in.
         """
         if self._connected:
             self._client.subscribe(topic, qos, callback)
@@ -181,8 +225,8 @@ class AWSClient(EdgeClient):
     def unsubscribe(self, topic):
         """Unsubscribe to the desired topic.
 
-        Args:
-            topic (str): Topic name to unsubscribe to.
+        :param topic: Topic name to unsubscribe to.
+        :type topic: str
         """
         if self._connected:
             self._client.unsubscribe(topic)
@@ -193,10 +237,11 @@ class AWSClient(EdgeClient):
         Retrieve the device shadow JSON document from the cloud by publishing an
         empty JSON document to the corresponding shadow topics.
 
-        Args:
-            callback: Function to be called when the response for a shadow
-                request comes back.
-            timeout_s (int): Timeout in seconds to perform the request.
+        :param callback: Function to be called when the response for a shadow
+            request comes back.
+
+        :param timeout_s: Timeout in seconds to perform the request.
+        :type timeout_s: int
         """
         if self._connected:
             self._shadow_handler.shadowGet(callback, timeout_s)
@@ -207,11 +252,15 @@ class AWSClient(EdgeClient):
         Update the device shadow JSON document string on the cloud by publishing
         the provided JSON document to the corresponding shadow topics.
 
-        Args:
-            payload (json): JSON document string used to update the shadow JSON
-                document on the cloud.
-            callback: Function to be called when the response for a shadow
-                request comes back.
+        :param payload: JSON document string used to update the shadow JSON
+            document on the cloud.
+        :type payload: json
+
+        :param callback: Function to be called when the response for a shadow
+            request comes back.
+
+        :param timeout_s: Timeout in seconds to perform the request.
+        :type timeout_s: int
         """
         if self._connected:
             self._shadow_handler.shadowUpdate(payload, callback, timeout_s)
@@ -222,10 +271,47 @@ class AWSClient(EdgeClient):
         Delete the device shadow from the cloud by publishing an empty JSON
         document to the corresponding shadow topics.
 
-        Args:
-            callback: Function to be called when the response for a shadow
-                request comes back.
-            timeout_s (int): Timeout in seconds to perform the request.
+        :param callback: Function to be called when the response for a shadow
+            request comes back.
+
+        :param timeout_s: Timeout in seconds to perform the request.
+        :type timeout_s: int
         """
         if self._connected:
             self._shadow_handler.shadowDelete(callback, timeout_s)
+
+    def add_listener(self, listener):
+        """Add a listener.
+        
+        :param listener: Listener to be added.
+        :type listener: :class:`edge_st_sdk.edge_client.EdgeClientListener`
+        """
+        if listener is not None:
+            with lock(self):
+                if not listener in self._listeners:
+                    self._listeners.append(listener)
+
+    def remove_listener(self, listener):
+        """Remove a listener.
+
+        :param listener: Listener to be removed.
+        :type listener: :class:`edge_st_sdk.edge_client.EdgeClientListener`
+        """
+        if listener is not None:
+            with lock(self):
+                if listener in self._listeners:
+                    self._listeners.remove(listener)
+
+    def _update_status(self, new_status):
+        """Update the status of the client.
+
+        :param new_status: New status.
+        :type new_status: :class:`edge_st_sdk.edge_client.EdgeClientStatus`
+        """
+        old_status = self._status
+        self._status = new_status
+        for listener in self._listeners:
+            # Calling user-defined callback.
+            self._thread_pool.submit(
+                listener.on_status_change(
+                    self, new_status.value, old_status.value))
